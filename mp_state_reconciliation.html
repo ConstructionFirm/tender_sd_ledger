@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MP State Reconciliation</title>
+
+<!-- ============================================================= -->
+<!--  CONFIG  —  EDIT THESE THREE LINES IN YOUR IDE, THEN SAVE.    -->
+<!--  Get them from Supabase: Project Settings → API.             -->
+<!-- ============================================================= -->
+<script>
+  const SUPABASE_URL      = "https://YOUR-PROJECT.supabase.co";  // <-- paste your Project URL
+  const SUPABASE_ANON_KEY = "YOUR-ANON-PUBLIC-KEY";              // <-- paste your anon public key
+  const DEFAULT_DEDUCTION = 2295;   // flat amount MP State keeps per transaction
+  const OVERDUE_DAYS      = 60;     // a pending refund older than this is flagged overdue
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+  :root{
+    --ink:#0f1e3d; --ink2:#1d3055; --paper:#f4f1ea; --card:#ffffff;
+    --line:#e4ddd0; --muted:#6b7280; --text:#1b2536;
+    --accent:#0d7a6f; --accent-d:#0a5f56;
+    --ok:#1f8a4c; --ok-bg:#dcf5e4;
+    --check:#c0392b; --check-bg:#fde4e1;
+    --pend:#b7791f; --pend-bg:#fdf2d8;
+    --orph:#555c66; --orph-bg:#e8e8ea;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'IBM Plex Sans',sans-serif;background:var(--paper);color:var(--text);
+    background-image:radial-gradient(var(--line) 0.5px,transparent 0.5px);background-size:22px 22px;}
+  .mono{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}
+  .num{font-family:'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums;text-align:right}
+
+  header{background:var(--ink);color:#fff;padding:20px 28px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px;border-bottom:3px solid var(--accent)}
+  header h1{font-weight:700;font-size:20px;letter-spacing:-0.3px;display:flex;align-items:center;gap:10px}
+  header h1 .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px rgba(13,122,111,.25)}
+  header .sub{font-size:12px;color:#9fb0cc;font-weight:400;margin-top:2px}
+  .conn{font-size:12px;display:flex;align-items:center;gap:8px}
+  .conn .led{width:9px;height:9px;border-radius:50%;background:#888}
+  .conn.ok .led{background:#3ddc84;box-shadow:0 0 8px #3ddc84}
+  .conn.bad .led{background:#ff5c5c;box-shadow:0 0 8px #ff5c5c}
+
+  .wrap{max-width:1180px;margin:0 auto;padding:22px}
+
+  .banner{background:#fff5e6;border:1px solid #f0c987;border-left:4px solid #d99417;border-radius:10px;padding:14px 18px;margin-bottom:18px;font-size:13.5px;line-height:1.55}
+  .banner code{background:#fde9c8;padding:1px 6px;border-radius:4px;font-family:'IBM Plex Mono'}
+
+  .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
+  .btn{font-family:inherit;font-size:13px;font-weight:600;border:none;border-radius:8px;padding:9px 15px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;transition:.15s;letter-spacing:.2px}
+  .btn:active{transform:translateY(1px)}
+  .btn-pri{background:var(--accent);color:#fff} .btn-pri:hover{background:var(--accent-d)}
+  .btn-dark{background:var(--ink);color:#fff} .btn-dark:hover{background:var(--ink2)}
+  .btn-out{background:#fff;color:var(--ink);border:1px solid var(--line)} .btn-out:hover{border-color:var(--accent);color:var(--accent)}
+  .btn-ghost{background:transparent;color:var(--muted);padding:6px 8px} .btn-ghost:hover{color:var(--check)}
+  .spacer{flex:1}
+  .ded-box{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);background:#fff;border:1px solid var(--line);border-radius:8px;padding:5px 10px}
+  .ded-box input{width:78px;font-family:'IBM Plex Mono';font-weight:600;font-size:13px;border:none;border-bottom:1.5px solid var(--accent);text-align:right;color:var(--ink);background:transparent;outline:none}
+
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;position:relative;overflow:hidden}
+  .card .k{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);font-weight:600}
+  .card .v{font-size:24px;font-weight:700;margin-top:6px;font-family:'IBM Plex Mono';font-variant-numeric:tabular-nums;color:var(--ink)}
+  .card .v.small{font-size:18px}
+  .card .bar{position:absolute;left:0;top:0;bottom:0;width:4px}
+  .card.c-ok .bar{background:var(--ok)} .card.c-check .bar{background:var(--check)}
+  .card.c-pend .bar{background:var(--pend)} .card.c-orph .bar{background:var(--orph)}
+  .card.c-money .bar{background:var(--accent)} .card.c-ink .bar{background:var(--ink)}
+
+  .tabs{display:flex;gap:4px;border-bottom:2px solid var(--line);margin-bottom:0}
+  .tab{font-size:13.5px;font-weight:600;padding:10px 18px;cursor:pointer;color:var(--muted);border:none;background:none;border-bottom:3px solid transparent;margin-bottom:-2px;font-family:inherit}
+  .tab.active{color:var(--ink);border-bottom-color:var(--accent)}
+  .tab .cnt{font-family:'IBM Plex Mono';font-size:11px;background:var(--line);color:var(--ink);border-radius:10px;padding:1px 7px;margin-left:6px}
+
+  .panel{background:var(--card);border:1px solid var(--line);border-top:none;border-radius:0 0 12px 12px;padding:0;overflow:hidden}
+  .tablewrap{overflow-x:auto}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead th{background:#f7f4ec;text-align:left;padding:10px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--line);white-space:nowrap;position:sticky;top:0}
+  tbody td{padding:9px 12px;border-bottom:1px solid #f0ece3;white-space:nowrap}
+  tbody tr:hover{background:#fafaf6}
+  th.num,td.num{text-align:right}
+  .pill{font-family:'IBM Plex Mono';font-size:11px;font-weight:600;padding:3px 9px;border-radius:20px;display:inline-block;letter-spacing:.3px}
+  .p-ok{background:var(--ok-bg);color:var(--ok)} .p-check{background:var(--check-bg);color:var(--check)}
+  .p-pend{background:var(--pend-bg);color:var(--pend)} .p-orph{background:var(--orph-bg);color:var(--orph)}
+  .row-edit{color:var(--muted);cursor:pointer;font-weight:600;font-size:12px}
+  .row-edit:hover{color:var(--accent)}
+  .empty{padding:40px;text-align:center;color:var(--muted);font-size:14px}
+
+  .formbar{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end;padding:14px 16px;background:#faf8f2;border-bottom:1px solid var(--line)}
+  .fld{display:flex;flex-direction:column;gap:3px}
+  .fld label{font-size:10.5px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:600}
+  .fld input{font-family:'IBM Plex Mono';font-size:13px;border:1px solid var(--line);border-radius:7px;padding:7px 9px;outline:none;background:#fff}
+  .fld input:focus{border-color:var(--accent)}
+  .fld.ref input{width:130px} .fld.amt input{width:120px} .fld.dt input{width:140px} .fld.ven input{width:300px}
+
+  .sql-wrap{margin-top:22px}
+  .sql-head{cursor:pointer;font-size:13px;font-weight:600;color:var(--ink);display:flex;align-items:center;gap:8px;user-select:none}
+  pre{background:var(--ink);color:#cfe3ff;border-radius:10px;padding:16px;overflow-x:auto;font-family:'IBM Plex Mono';font-size:12px;line-height:1.6;margin-top:10px}
+  .toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--ink);color:#fff;padding:11px 20px;border-radius:9px;font-size:13.5px;opacity:0;transition:.25s;pointer-events:none;z-index:99;box-shadow:0 8px 30px rgba(0,0,0,.25)}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast.err{background:var(--check)}
+  footer{text-align:center;color:var(--muted);font-size:11.5px;padding:24px}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1><span class="dot"></span> MP State Reconciliation</h1>
+    <div class="sub">Payments &amp; ₹2,295 refunds · matched by reference number</div>
+  </div>
+  <div class="conn" id="conn"><span class="led"></span><span id="connTxt">connecting…</span></div>
+</header>
+
+<div class="wrap">
+  <div id="setupBanner" class="banner" style="display:none">
+    <strong>One-time setup.</strong> Open this file in your IDE and fill in <code>SUPABASE_URL</code> and
+    <code>SUPABASE_ANON_KEY</code> at the top, then run the SQL at the bottom of this page once in your Supabase SQL editor. Reload after saving.
+  </div>
+
+  <div class="toolbar">
+    <button class="btn btn-pri" onclick="document.getElementById('xlsxInput').click()">⬆ Import Excel</button>
+    <input type="file" id="xlsxInput" accept=".xlsx,.xls" style="display:none" onchange="importExcel(event)">
+    <button class="btn btn-dark" onclick="exportExcel()">⬇ Export Excel</button>
+    <button class="btn btn-out" onclick="loadAll()">↻ Refresh</button>
+    <div class="spacer"></div>
+    <div class="ded-box">Deduction ₹ <input id="dedInput" class="mono" type="number" value="2295" onchange="setDeduction(this.value)"></div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="tabs">
+    <button class="tab active" data-tab="recon" onclick="switchTab('recon')">Reconciliation <span class="cnt" id="cntRecon">0</span></button>
+    <button class="tab" data-tab="debits" onclick="switchTab('debits')">Debits <span class="cnt" id="cntDebits">0</span></button>
+    <button class="tab" data-tab="credits" onclick="switchTab('credits')">Credits <span class="cnt" id="cntCredits">0</span></button>
+  </div>
+
+  <!-- RECONCILIATION -->
+  <div class="panel" id="panel-recon">
+    <div class="tablewrap">
+      <table>
+        <thead><tr>
+          <th>Ref No</th><th>Debit Date</th><th class="num">Amount Paid</th>
+          <th>Credit Date</th><th class="num">Amount Refunded</th>
+          <th class="num">Deduction</th><th class="num">Days</th><th>Status</th>
+        </tr></thead>
+        <tbody id="reconBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- DEBITS -->
+  <div class="panel" id="panel-debits" style="display:none">
+    <div class="formbar">
+      <div class="fld ref"><label>Ref No</label><input id="d_ref" placeholder="1467156231"></div>
+      <div class="fld ven"><label>Vendor / Narration</label><input id="d_ven" placeholder="EBANK:…/MADHYA_PRADESH_STATE/…"></div>
+      <div class="fld amt"><label>Amount Paid</label><input id="d_amt" type="number" step="0.01"></div>
+      <div class="fld dt"><label>Date Paid (dd/mm/yyyy)</label><input id="d_dt" placeholder="06/08/2025"></div>
+      <button class="btn btn-pri" id="d_save" onclick="saveDebit()">Add</button>
+      <button class="btn btn-ghost" id="d_cancel" style="display:none" onclick="resetDebitForm()">cancel</button>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Ref No</th><th>Vendor / Narration</th><th class="num">Amount Paid</th><th>Date Paid</th><th></th></tr></thead>
+        <tbody id="debitsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- CREDITS -->
+  <div class="panel" id="panel-credits" style="display:none">
+    <div class="formbar">
+      <div class="fld ref"><label>Ref No</label><input id="c_ref" placeholder="1467156231"></div>
+      <div class="fld amt"><label>Amount Refunded</label><input id="c_amt" type="number" step="0.01"></div>
+      <div class="fld dt"><label>Date Received (dd/mm/yyyy)</label><input id="c_dt" placeholder="30/09/2025"></div>
+      <button class="btn btn-pri" id="c_save" onclick="saveCredit()">Add</button>
+      <button class="btn btn-ghost" id="c_cancel" style="display:none" onclick="resetCreditForm()">cancel</button>
+    </div>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Ref No</th><th class="num">Amount Refunded</th><th>Date Received</th><th></th></tr></thead>
+        <tbody id="creditsBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="sql-wrap">
+    <div class="sql-head" onclick="var p=document.getElementById('sqlPre');p.style.display=p.style.display==='none'?'block':'none'">
+      ▸ One-time database setup SQL (run once in Supabase → SQL Editor)
+    </div>
+    <pre id="sqlPre" style="display:none">create table if not exists recon_debits (
+  id          bigint generated always as identity primary key,
+  ref         text not null unique,
+  vendor      text,
+  amount      numeric,
+  paid_date   date,
+  created_at  timestamptz default now()
+);
+
+create table if not exists recon_credits (
+  id            bigint generated always as identity primary key,
+  ref           text not null unique,
+  amount        numeric,
+  received_date date,
+  created_at    timestamptz default now()
+);
+
+-- allow the anon key to read/write (simple setup for a private tool)
+alter table recon_debits  enable row level security;
+alter table recon_credits enable row level security;
+create policy "anon all recon_debits"  on recon_debits  for all using (true) with check (true);
+create policy "anon all recon_credits" on recon_credits for all using (true) with check (true);</pre>
+  </div>
+
+  <footer>Matched only by Ref No · dates &amp; amounts need not align · deduction value is editable above</footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* ---------- state ---------- */
+let sb = null;
+let DEBITS = [], CREDITS = [];
+let DEDUCTION = DEFAULT_DEDUCTION;
+let editingDebitId = null, editingCreditId = null;
+
+/* ---------- helpers ---------- */
+const $ = id => document.getElementById(id);
+function toast(msg, err){ const t=$('toast'); t.textContent=msg; t.className='toast show'+(err?' err':''); setTimeout(()=>t.className='toast',2600); }
+function fmtMoney(n){ return (n==null||n==='')?'':Number(n).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function fmtDateISO(iso){ if(!iso) return ''; const [y,m,d]=iso.split('-'); return `${d}/${m}/${y}`; }
+function todayISO(){ return new Date().toISOString().slice(0,10); }
+function daysBetween(a,b){ return Math.round((new Date(b)-new Date(a))/86400000); }
+
+/* parse any date input -> ISO yyyy-mm-dd (accepts JS Date, Excel serial, dd/mm/yyyy, yyyy-mm-dd) */
+function toISO(v){
+  if(v==null||v==='') return null;
+  if(v instanceof Date) return new Date(Date.UTC(v.getFullYear(),v.getMonth(),v.getDate())).toISOString().slice(0,10);
+  if(typeof v==='number'){ const d=new Date(Date.UTC(1899,11,30)+v*86400000); return d.toISOString().slice(0,10); }
+  const s=String(v).trim();
+  let m=s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/); if(m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+  m=s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);   if(m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+  const d=new Date(s); return isNaN(d)?null:d.toISOString().slice(0,10);
+}
+function num(v){ if(v==null||v==='') return null; const n=Number(String(v).replace(/,/g,'').trim()); return isNaN(n)?null:n; }
+
+/* ---------- connection ---------- */
+function initClient(){
+  const configured = SUPABASE_URL && !SUPABASE_URL.includes('YOUR-PROJECT') && SUPABASE_ANON_KEY && !SUPABASE_ANON_KEY.includes('YOUR-ANON');
+  if(!configured){ $('setupBanner').style.display='block'; setConn(false,'not configured'); return false; }
+  try{ sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY); return true; }
+  catch(e){ setConn(false,'init failed'); return false; }
+}
+function setConn(ok,txt){ const c=$('conn'); c.className='conn '+(ok?'ok':'bad'); $('connTxt').textContent=txt; }
+
+/* ---------- load ---------- */
+async function loadAll(){
+  if(!sb) return;
+  try{
+    const [d,c] = await Promise.all([
+      sb.from('recon_debits').select('*').order('paid_date',{ascending:true}),
+      sb.from('recon_credits').select('*').order('received_date',{ascending:true})
+    ]);
+    if(d.error) throw d.error; if(c.error) throw c.error;
+    DEBITS=d.data||[]; CREDITS=c.data||[];
+    setConn(true,'connected · '+(DEBITS.length+CREDITS.length)+' rows');
+    renderAll();
+  }catch(e){ setConn(false,'error'); toast('Load failed: '+(e.message||e),true); console.error(e); }
+}
+
+/* ---------- reconciliation compute ---------- */
+function computeRecon(){
+  const dmap={}, cmap={};
+  DEBITS.forEach(d=>dmap[d.ref]=d);
+  CREDITS.forEach(c=>cmap[c.ref]=c);
+  const refs=[...new Set([...DEBITS.map(d=>d.ref),...CREDITS.map(c=>c.ref)])];
+  const today=todayISO();
+  const rows=refs.map(ref=>{
+    const d=dmap[ref], c=cmap[ref];
+    const da=d?d.amount:null, ca=c?c.amount:null;
+    const ded=(d&&c)?Math.round((da-ca)*100)/100:null;
+    const days=(d&&c&&d.paid_date&&c.received_date)?daysBetween(d.paid_date,c.received_date):null;
+    let status;
+    if(!d&&c) status='ORPHAN';
+    else if(d&&!c) status=(d.paid_date&&daysBetween(d.paid_date,today)>OVERDUE_DAYS)?'PENDING_OVERDUE':'PENDING';
+    else status=(ded===Math.round(DEDUCTION*100)/100)?'OK':'CHECK';
+    return {ref,debit:d,credit:c,da,ca,ded,days,status,
+      sortDate:(d&&d.paid_date)?d.paid_date:(c?c.received_date:'9999')};
+  });
+  rows.sort((a,b)=> a.sortDate<b.sortDate?-1:a.sortDate>b.sortDate?1:0);
+  return rows;
+}
+
+/* ---------- render ---------- */
+function renderAll(){ renderRecon(); renderDebits(); renderCredits(); }
+
+const STATUS_META={
+  OK:{cls:'p-ok',txt:'OK'}, CHECK:{cls:'p-check',txt:'CHECK'},
+  PENDING:{cls:'p-pend',txt:'PENDING'}, PENDING_OVERDUE:{cls:'p-pend',txt:'PENDING · OVERDUE'},
+  ORPHAN:{cls:'p-orph',txt:'ORPHAN'}
+};
+
+function renderRecon(){
+  const rows=computeRecon();
+  const tb=$('reconBody'); tb.innerHTML='';
+  if(!rows.length){ tb.innerHTML='<tr><td colspan="8" class="empty">No data yet — import your Excel or add rows.</td></tr>'; }
+  rows.forEach(r=>{
+    const m=STATUS_META[r.status];
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td class="mono">${r.ref}</td>
+      <td class="mono">${r.debit?fmtDateISO(r.debit.paid_date):''}</td>
+      <td class="num">${fmtMoney(r.da)}</td>
+      <td class="mono">${r.credit?fmtDateISO(r.credit.received_date):''}</td>
+      <td class="num">${fmtMoney(r.ca)}</td>
+      <td class="num">${r.ded==null?'':fmtMoney(r.ded)}</td>
+      <td class="num">${r.days==null?'':r.days}</td>
+      <td><span class="pill ${m.cls}">${m.txt}</span></td>`;
+    tb.appendChild(tr);
+  });
+  $('cntRecon').textContent=rows.length;
+  renderCards(rows);
+}
+
+function renderCards(rows){
+  const c={OK:0,CHECK:0,PENDING:0,PENDING_OVERDUE:0,ORPHAN:0};
+  let paidOut=0, refunded=0, deducted=0, pendingExpected=0;
+  rows.forEach(r=>{
+    c[r.status]++;
+    if(r.da!=null) paidOut+=r.da;
+    if(r.ca!=null) refunded+=r.ca;
+    if(r.ded!=null) deducted+=r.ded;
+    if(r.status==='PENDING'||r.status==='PENDING_OVERDUE') pendingExpected += (r.da-DEDUCTION);
+  });
+  const pendTotal=c.PENDING+c.PENDING_OVERDUE;
+  $('cards').innerHTML=`
+    <div class="card c-ok"><div class="bar"></div><div class="k">OK</div><div class="v">${c.OK}</div></div>
+    <div class="card c-check"><div class="bar"></div><div class="k">Check</div><div class="v">${c.CHECK}</div></div>
+    <div class="card c-pend"><div class="bar"></div><div class="k">Pending${c.PENDING_OVERDUE?` · ${c.PENDING_OVERDUE} overdue`:''}</div><div class="v">${pendTotal}</div></div>
+    <div class="card c-orph"><div class="bar"></div><div class="k">Orphan</div><div class="v">${c.ORPHAN}</div></div>
+    <div class="card c-money"><div class="bar"></div><div class="k">Deducted ₹</div><div class="v small">${fmtMoney(deducted)}</div></div>
+    <div class="card c-ink"><div class="bar"></div><div class="k">Refund expected ₹</div><div class="v small">${fmtMoney(pendingExpected)}</div></div>`;
+}
+
+function renderDebits(){
+  const tb=$('debitsBody'); tb.innerHTML='';
+  if(!DEBITS.length) tb.innerHTML='<tr><td colspan="5" class="empty">No debit rows.</td></tr>';
+  DEBITS.forEach(d=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td class="mono">${d.ref}</td><td>${d.vendor||''}</td>
+      <td class="num">${fmtMoney(d.amount)}</td><td class="mono">${fmtDateISO(d.paid_date)}</td>
+      <td><span class="row-edit" onclick='editDebit(${d.id})'>edit</span> &nbsp;
+          <span class="row-edit" style="color:var(--check)" onclick='delRow("recon_debits",${d.id})'>del</span></td>`;
+    tb.appendChild(tr);
+  });
+  $('cntDebits').textContent=DEBITS.length;
+}
+function renderCredits(){
+  const tb=$('creditsBody'); tb.innerHTML='';
+  if(!CREDITS.length) tb.innerHTML='<tr><td colspan="4" class="empty">No credit rows.</td></tr>';
+  CREDITS.forEach(c=>{
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td class="mono">${c.ref}</td><td class="num">${fmtMoney(c.amount)}</td>
+      <td class="mono">${fmtDateISO(c.received_date)}</td>
+      <td><span class="row-edit" onclick='editCredit(${c.id})'>edit</span> &nbsp;
+          <span class="row-edit" style="color:var(--check)" onclick='delRow("recon_credits",${c.id})'>del</span></td>`;
+    tb.appendChild(tr);
+  });
+  $('cntCredits').textContent=CREDITS.length;
+}
+
+/* ---------- tabs ---------- */
+function switchTab(t){
+  document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===t));
+  ['recon','debits','credits'].forEach(p=>$('panel-'+p).style.display=(p===t)?'block':'none');
+}
+
+/* ---------- deduction ---------- */
+function setDeduction(v){ const n=Number(v); if(!isNaN(n)){ DEDUCTION=n; renderRecon(); } }
+
+/* ---------- CRUD: debits ---------- */
+async function saveDebit(){
+  if(!sb) return toast('Not connected',true);
+  const row={ref:$('d_ref').value.trim(), vendor:$('d_ven').value.trim()||null,
+    amount:num($('d_amt').value), paid_date:toISO($('d_dt').value)};
+  if(!row.ref) return toast('Ref No required',true);
+  try{
+    let res;
+    if(editingDebitId) res=await sb.from('recon_debits').update(row).eq('id',editingDebitId);
+    else res=await sb.from('recon_debits').upsert(row,{onConflict:'ref'});
+    if(res.error) throw res.error;
+    toast(editingDebitId?'Debit updated':'Debit saved'); resetDebitForm(); loadAll();
+  }catch(e){ toast('Save failed: '+(e.message||e),true); }
+}
+function editDebit(id){
+  const d=DEBITS.find(x=>x.id===id); if(!d) return;
+  editingDebitId=id; switchTab('debits');
+  $('d_ref').value=d.ref; $('d_ven').value=d.vendor||''; $('d_amt').value=d.amount??''; $('d_dt').value=fmtDateISO(d.paid_date);
+  $('d_save').textContent='Save'; $('d_cancel').style.display='inline-flex';
+}
+function resetDebitForm(){ editingDebitId=null; ['d_ref','d_ven','d_amt','d_dt'].forEach(i=>$(i).value=''); $('d_save').textContent='Add'; $('d_cancel').style.display='none'; }
+
+/* ---------- CRUD: credits ---------- */
+async function saveCredit(){
+  if(!sb) return toast('Not connected',true);
+  const row={ref:$('c_ref').value.trim(), amount:num($('c_amt').value), received_date:toISO($('c_dt').value)};
+  if(!row.ref) return toast('Ref No required',true);
+  try{
+    let res;
+    if(editingCreditId) res=await sb.from('recon_credits').update(row).eq('id',editingCreditId);
+    else res=await sb.from('recon_credits').upsert(row,{onConflict:'ref'});
+    if(res.error) throw res.error;
+    toast(editingCreditId?'Credit updated':'Credit saved'); resetCreditForm(); loadAll();
+  }catch(e){ toast('Save failed: '+(e.message||e),true); }
+}
+function editCredit(id){
+  const c=CREDITS.find(x=>x.id===id); if(!c) return;
+  editingCreditId=id; switchTab('credits');
+  $('c_ref').value=c.ref; $('c_amt').value=c.amount??''; $('c_dt').value=fmtDateISO(c.received_date);
+  $('c_save').textContent='Save'; $('c_cancel').style.display='inline-flex';
+}
+function resetCreditForm(){ editingCreditId=null; ['c_ref','c_amt','c_dt'].forEach(i=>$(i).value=''); $('c_save').textContent='Add'; $('c_cancel').style.display='none'; }
+
+async function delRow(table,id){
+  if(!sb) return; if(!confirm('Delete this row?')) return;
+  try{ const {error}=await sb.from(table).delete().eq('id',id); if(error) throw error; toast('Deleted'); loadAll(); }
+  catch(e){ toast('Delete failed: '+(e.message||e),true); }
+}
+
+/* ---------- Excel import ---------- */
+function findTable(aoa){
+  // locate header row containing a "Ref" cell, map columns by header keyword
+  for(let i=0;i<Math.min(aoa.length,8);i++){
+    const row=aoa[i]||[];
+    const idx={ref:-1,vendor:-1,amount:-1,date:-1};
+    row.forEach((cell,j)=>{
+      const h=String(cell||'').toLowerCase();
+      if(idx.ref<0 && h.includes('ref')) idx.ref=j;
+      else if(idx.vendor<0 && (h.includes('vendor')||h.includes('narration'))) idx.vendor=j;
+      else if(idx.amount<0 && (h.includes('amount')||h==='debit'||h==='credit')) idx.amount=j;
+      else if(idx.date<0 && h.includes('date')) idx.date=j;
+    });
+    if(idx.ref>=0 && idx.amount>=0) return {start:i+1,idx};
+  }
+  return null;
+}
+async function importExcel(ev){
+  const file=ev.target.files[0]; ev.target.value=''; if(!file) return;
+  if(!sb) return toast('Connect to Supabase first',true);
+  try{
+    const buf=await file.arrayBuffer();
+    const wb=XLSX.read(buf,{type:'array',cellDates:true});
+    const findSheet=kw=>wb.SheetNames.find(n=>n.toLowerCase().includes(kw));
+    const dName=findSheet('debit'), cName=findSheet('credit');
+    let debitRows=[], creditRows=[];
+
+    if(dName){
+      const aoa=XLSX.utils.sheet_to_json(wb.Sheets[dName],{header:1,raw:true,blankrows:false});
+      const t=findTable(aoa);
+      if(t) for(let i=t.start;i<aoa.length;i++){ const r=aoa[i]; const ref=String(r[t.idx.ref]??'').trim();
+        if(!ref) continue;
+        debitRows.push({ref, vendor:t.idx.vendor>=0?(r[t.idx.vendor]??null):null, amount:num(r[t.idx.amount]), paid_date:toISO(r[t.idx.date])}); }
+    }
+    if(cName){
+      const aoa=XLSX.utils.sheet_to_json(wb.Sheets[cName],{header:1,raw:true,blankrows:false});
+      const t=findTable(aoa);
+      if(t) for(let i=t.start;i<aoa.length;i++){ const r=aoa[i]; const ref=String(r[t.idx.ref]??'').trim();
+        if(!ref) continue;
+        creditRows.push({ref, amount:num(r[t.idx.amount]), received_date:toISO(r[t.idx.date])}); }
+    }
+    if(!debitRows.length && !creditRows.length) return toast('No "Debit"/"Credit" sheets with a Ref column found',true);
+
+    // de-dupe by ref within each set (last wins), then batched upsert
+    const dedupe=(arr)=>{ const m={}; arr.forEach(x=>m[x.ref]=x); return Object.values(m); };
+    debitRows=dedupe(debitRows); creditRows=dedupe(creditRows);
+
+    const batch=async(table,rows)=>{ for(let i=0;i<rows.length;i+=400){ const {error}=await sb.from(table).upsert(rows.slice(i,i+400),{onConflict:'ref'}); if(error) throw error; } };
+    if(debitRows.length) await batch('recon_debits',debitRows);
+    if(creditRows.length) await batch('recon_credits',creditRows);
+    toast(`Imported ${debitRows.length} debit · ${creditRows.length} credit rows`);
+    loadAll();
+  }catch(e){ toast('Import failed: '+(e.message||e),true); console.error(e); }
+}
+
+/* ---------- Excel export (same 4-sheet layout) ---------- */
+function exportExcel(){
+  const rows=computeRecon();
+  const wb=XLSX.utils.book_new();
+
+  const dAoa=[['DEBIT — payments made to MADHYA PRADESH STATE (money paid OUT)'],[],
+    ['Ref No','Vendor / Narration','Amount Paid','Date Paid']];
+  DEBITS.forEach(d=>dAoa.push([d.ref,d.vendor||'',d.amount,fmtDateISO(d.paid_date)]));
+  const ds=XLSX.utils.aoa_to_sheet(dAoa); ds['!cols']=[{wch:14},{wch:46},{wch:14},{wch:13}];
+  XLSX.utils.book_append_sheet(wb,ds,'Debit');
+
+  const cAoa=[['CREDIT — refunds received back (money paid IN)'],[],
+    ['Ref No','Amount Refunded','Date Received']];
+  CREDITS.forEach(c=>cAoa.push([c.ref,c.amount,fmtDateISO(c.received_date)]));
+  const cs=XLSX.utils.aoa_to_sheet(cAoa); cs['!cols']=[{wch:14},{wch:16},{wch:14}];
+  XLSX.utils.book_append_sheet(wb,cs,'Credit');
+
+  const stTxt={OK:'OK',CHECK:'CHECK',PENDING:'PENDING',PENDING_OVERDUE:'PENDING (overdue)',ORPHAN:'ORPHAN'};
+  const rAoa=[['RECONCILIATION — matched by Ref No · deduction ₹'+DEDUCTION],[],
+    ['Ref No','Debit Date','Amount Paid','Credit Date','Amount Refunded','Deduction','Days to Refund','Status']];
+  rows.forEach(r=>rAoa.push([r.ref, r.debit?fmtDateISO(r.debit.paid_date):'', r.da??'',
+    r.credit?fmtDateISO(r.credit.received_date):'', r.ca??'', r.ded??'', r.days??'', stTxt[r.status]]));
+  const rs=XLSX.utils.aoa_to_sheet(rAoa); rs['!cols']=[{wch:14},{wch:12},{wch:14},{wch:12},{wch:16},{wch:12},{wch:13},{wch:18}];
+  XLSX.utils.book_append_sheet(wb,rs,'Reconciliation');
+
+  const cnt={OK:0,CHECK:0,PENDING:0,PENDING_OVERDUE:0,ORPHAN:0}; let paid=0,ref=0,ded=0,exp=0;
+  rows.forEach(r=>{cnt[r.status]++; if(r.da!=null)paid+=r.da; if(r.ca!=null)ref+=r.ca; if(r.ded!=null)ded+=r.ded; if(r.status.startsWith('PENDING'))exp+=(r.da-DEDUCTION);});
+  const sAoa=[['SUMMARY'],[],
+    ['Matched & correct (OK)',cnt.OK],
+    ['Matched but wrong deduction (CHECK)',cnt.CHECK],
+    ['Awaiting refund (PENDING)',cnt.PENDING+cnt.PENDING_OVERDUE],
+    ['   of which overdue',cnt.PENDING_OVERDUE],
+    ['Refund with no payment (ORPHAN)',cnt.ORPHAN],[],
+    ['Total paid out (₹)',Math.round(paid*100)/100],
+    ['Total refunded (₹)',Math.round(ref*100)/100],
+    ['Total deducted by MP State (₹)',Math.round(ded*100)/100],
+    ['Refund still expected (₹, approx)',Math.round(exp*100)/100]];
+  const ss=XLSX.utils.aoa_to_sheet(sAoa); ss['!cols']=[{wch:36},{wch:16}];
+  XLSX.utils.book_append_sheet(wb,ss,'Summary');
+
+  XLSX.writeFile(wb,'MP_State_Reconciliation_'+todayISO()+'.xlsx');
+  toast('Excel exported');
+}
+
+/* ---------- boot ---------- */
+if(initClient()) loadAll();
+</script>
+</body>
+</html>
