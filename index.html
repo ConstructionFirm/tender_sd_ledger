@@ -148,6 +148,7 @@
     <button class="btn btn-out" onclick="loadAll()">↻ Refresh</button>
     <div class="spacer"></div>
     <div class="ded-box">Deduction ₹ <input id="dedInput" class="mono" type="number" value="2295" onchange="setDeduction(this.value)"></div>
+    <button class="btn btn-del" onclick="clearAll()">🗑 Clear all</button>
   </div>
 
   <div class="cards" id="cards"></div>
@@ -414,6 +415,20 @@ function switchTab(t){
 /* ---------- deduction ---------- */
 function setDeduction(v){ const n=Number(v); if(!isNaN(n)){ DEDUCTION=n; renderRecon(); } }
 
+/* ---------- clear everything ---------- */
+async function clearAll(){
+  if(!sb) return toast('Not connected',true);
+  if((DEBITS.length+CREDITS.length)===0) return toast('Nothing to clear');
+  const ans=prompt('This permanently deletes ALL debits, credits and status overrides.\nType DELETE to confirm:');
+  if(ans!=='DELETE') return toast('Cancelled');
+  try{
+    const r1=await sb.from('recon_debits').delete().gte('id',0);   if(r1.error) throw r1.error;
+    const r2=await sb.from('recon_credits').delete().gte('id',0);  if(r2.error) throw r2.error;
+    const r3=await sb.from(T_STATUS).delete().not('ref','is',null); // ignore if table absent
+    toast('All entries cleared'); loadAll();
+  }catch(e){ toast('Clear failed: '+(e.message||e),true); }
+}
+
 /* ---------- CRUD: debits ---------- */
 async function saveDebit(){
   if(!sb) return toast('Not connected',true);
@@ -499,20 +514,31 @@ async function resetStatusToAuto(){
   catch(e){ toast('Reset failed: '+(e.message||e),true); }
 }
 
-/* ---------- Excel import ---------- */
-function findTable(aoa){
-  // locate header row containing a "Ref" cell, map columns by header keyword
-  for(let i=0;i<Math.min(aoa.length,8);i++){
+/* ---------- Excel import (handles bank-statement format AND clean export format) ---------- */
+function extractRef(v){
+  const s=String(v==null?'':v).trim();
+  let m=s.match(/EBANK:\s*(\d{6,})/i); if(m) return m[1];   // EBANK:1111010587/...  -> 1111010587
+  m=s.match(/\d{6,}/);                if(m) return m[0];    // bare ref like 1493645377
+  return s;
+}
+function findCols(aoa){
+  for(let i=0;i<Math.min(aoa.length,10);i++){
     const row=aoa[i]||[];
-    const idx={ref:-1,vendor:-1,amount:-1,date:-1};
+    const idx={ref:-1,narration:-1,vendor:-1,date:-1,withdrawal:-1,deposit:-1,amount:-1};
     row.forEach((cell,j)=>{
       const h=String(cell||'').toLowerCase();
-      if(idx.ref<0 && h.includes('ref')) idx.ref=j;
-      else if(idx.vendor<0 && (h.includes('vendor')||h.includes('narration'))) idx.vendor=j;
-      else if(idx.amount<0 && (h.includes('amount')||h==='debit'||h==='credit')) idx.amount=j;
-      else if(idx.date<0 && h.includes('date')) idx.date=j;
+      if(idx.ref<0       && h.includes('ref')) idx.ref=j;
+      if(idx.narration<0 && h.includes('narration')) idx.narration=j;
+      if(idx.vendor<0    && h.includes('vendor')) idx.vendor=j;
+      if(idx.date<0      && h.includes('tran') && h.includes('date')) idx.date=j;     // prefer TRAN DATE
+      if(idx.withdrawal<0&& (h.includes('withdrawal')||h.includes('(dr)'))) idx.withdrawal=j;
+      if(idx.deposit<0   && (h.includes('deposit')||h.includes('(cr)'))) idx.deposit=j;
+      if(idx.amount<0    && h.includes('amount')) idx.amount=j;
     });
-    if(idx.ref>=0 && idx.amount>=0) return {start:i+1,idx};
+    if(idx.date<0) row.forEach((cell,j)=>{ if(idx.date<0 && String(cell||'').toLowerCase().includes('date')) idx.date=j; });
+    const hasId=(idx.ref>=0||idx.narration>=0||idx.vendor>=0);
+    const hasAmt=(idx.amount>=0||idx.withdrawal>=0||idx.deposit>=0);
+    if(hasId && hasAmt) return {start:i+1, idx};
   }
   return null;
 }
@@ -522,28 +548,38 @@ async function importExcel(ev){
   try{
     const buf=await file.arrayBuffer();
     const wb=XLSX.read(buf,{type:'array',cellDates:true});
-    const findSheet=kw=>wb.SheetNames.find(n=>n.toLowerCase().includes(kw));
-    const dName=findSheet('debit'), cName=findSheet('credit');
     let debitRows=[], creditRows=[];
 
-    if(dName){
-      const aoa=XLSX.utils.sheet_to_json(wb.Sheets[dName],{header:1,raw:true,blankrows:false});
-      const t=findTable(aoa);
-      if(t) for(let i=t.start;i<aoa.length;i++){ const r=aoa[i]; const ref=String(r[t.idx.ref]??'').trim();
-        if(!ref) continue;
-        debitRows.push({ref, vendor:t.idx.vendor>=0?(r[t.idx.vendor]??null):null, amount:num(r[t.idx.amount]), paid_date:toISO(r[t.idx.date])}); }
-    }
-    if(cName){
-      const aoa=XLSX.utils.sheet_to_json(wb.Sheets[cName],{header:1,raw:true,blankrows:false});
-      const t=findTable(aoa);
-      if(t) for(let i=t.start;i<aoa.length;i++){ const r=aoa[i]; const ref=String(r[t.idx.ref]??'').trim();
-        if(!ref) continue;
-        creditRows.push({ref, amount:num(r[t.idx.amount]), received_date:toISO(r[t.idx.date])}); }
-    }
-    if(!debitRows.length && !creditRows.length) return toast('No "Debit"/"Credit" sheets with a Ref column found',true);
+    wb.SheetNames.forEach(name=>{
+      const aoa=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,raw:true,blankrows:false});
+      const t=findCols(aoa); if(!t) return;
+      const x=t.idx;
+      const nm=name.toLowerCase();
+      const sheetIsCredit=nm.includes('credit'), sheetIsDebit=nm.includes('debit');
+      for(let i=t.start;i<aoa.length;i++){
+        const r=aoa[i]||[];
+        const nar = x.narration>=0 ? r[x.narration] : (x.vendor>=0?r[x.vendor]:'');
+        let ref = (x.ref>=0 && String(r[x.ref]??'').trim()) ? String(r[x.ref]).trim() : extractRef(nar);
+        if(!ref || !/\d/.test(ref)) continue;                 // skip header/blank/summary rows
+        const wd = x.withdrawal>=0 ? num(r[x.withdrawal]) : null;
+        const dp = x.deposit>=0    ? num(r[x.deposit])    : null;
+        const am = x.amount>=0     ? num(r[x.amount])     : null;
+        const date = x.date>=0 ? toISO(r[x.date]) : null;
+        const vendor = (x.narration>=0||x.vendor>=0) ? (nar??null) : null;
+        // decide debit vs credit by which money column is filled, else by sheet name
+        if(wd!=null && wd!==0)            debitRows.push({ref, vendor, amount:wd, paid_date:date});
+        else if(dp!=null && dp!==0)       creditRows.push({ref, amount:dp, received_date:date});
+        else if(am!=null){
+          if(sheetIsCredit)               creditRows.push({ref, amount:am, received_date:date});
+          else                            debitRows.push({ref, vendor, amount:am, paid_date:date});
+        }
+      }
+    });
 
-    // de-dupe by ref within each set (last wins), then batched upsert
-    const dedupe=(arr)=>{ const m={}; arr.forEach(x=>m[x.ref]=x); return Object.values(m); };
+    if(!debitRows.length && !creditRows.length)
+      return toast('No usable rows found — check the headers (NARRATION, WITHDRAWAL/DEPOSIT, TRAN DATE).',true);
+
+    const dedupe=arr=>{ const m={}; arr.forEach(x=>m[x.ref]=x); return Object.values(m); };
     debitRows=dedupe(debitRows); creditRows=dedupe(creditRows);
 
     const batch=async(table,rows)=>{ for(let i=0;i<rows.length;i+=400){ const {error}=await sb.from(table).upsert(rows.slice(i,i+400),{onConflict:'ref'}); if(error) throw error; } };
