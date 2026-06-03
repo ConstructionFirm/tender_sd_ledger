@@ -15,7 +15,7 @@
   const DEFAULT_DEDUCTION = 2295;   // flat amount MP State keeps per transaction
   const OVERDUE_DAYS      = 60;     // a pending refund older than this is flagged overdue
 </script>
-
+  
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -522,7 +522,7 @@ function extractRef(v){
   return s;
 }
 function findCols(aoa){
-  for(let i=0;i<Math.min(aoa.length,10);i++){
+  for(let i=0;i<Math.min(aoa.length,50);i++){
     const row=aoa[i]||[];
     const idx={ref:-1,narration:-1,vendor:-1,date:-1,withdrawal:-1,deposit:-1,amount:-1};
     row.forEach((cell,j)=>{
@@ -548,7 +548,7 @@ async function importExcel(ev){
   try{
     const buf=await file.arrayBuffer();
     const wb=XLSX.read(buf,{type:'array',cellDates:true});
-    let debitRows=[], creditRows=[];
+    let debitRows=[], creditRows=[], skipped=0;
 
     wb.SheetNames.forEach(name=>{
       const aoa=XLSX.utils.sheet_to_json(wb.Sheets[name],{header:1,raw:true,blankrows:false});
@@ -556,9 +556,11 @@ async function importExcel(ev){
       const x=t.idx;
       const nm=name.toLowerCase();
       const sheetIsCredit=nm.includes('credit'), sheetIsDebit=nm.includes('debit');
+      const bankStyle = (x.withdrawal>=0 && x.deposit>=0);   // a real bank statement has both columns
       for(let i=t.start;i<aoa.length;i++){
         const r=aoa[i]||[];
         const nar = x.narration>=0 ? r[x.narration] : (x.vendor>=0?r[x.vendor]:'');
+        const narStr = String(nar==null?'':nar);
         let ref = (x.ref>=0 && String(r[x.ref]??'').trim()) ? String(r[x.ref]).trim() : extractRef(nar);
         if(!ref || !/\d/.test(ref)) continue;                 // skip header/blank/summary rows
         const wd = x.withdrawal>=0 ? num(r[x.withdrawal]) : null;
@@ -566,12 +568,18 @@ async function importExcel(ev){
         const am = x.amount>=0     ? num(r[x.amount])     : null;
         const date = x.date>=0 ? toISO(r[x.date]) : null;
         const vendor = (x.narration>=0||x.vendor>=0) ? (nar??null) : null;
-        // decide debit vs credit by which money column is filled, else by sheet name
-        if(wd!=null && wd!==0)            debitRows.push({ref, vendor, amount:wd, paid_date:date});
-        else if(dp!=null && dp!==0)       creditRows.push({ref, amount:dp, received_date:date});
-        else if(am!=null){
-          if(sheetIsCredit)               creditRows.push({ref, amount:am, received_date:date});
-          else                            debitRows.push({ref, vendor, amount:am, paid_date:date});
+        if(wd!=null && wd!==0){
+          // debit: in a raw statement keep only MP-State / EBANK rows
+          if(bankStyle && !/ebank|madhya/i.test(narStr)){ skipped++; continue; }
+          debitRows.push({ref, vendor, amount:wd, paid_date:date});
+        } else if(dp!=null && dp!==0){
+          // a genuine MP refund credit has a narration that is EXACTLY a 10-digit ref number
+          // (it equals the original debit's EBANK ref). Anything with text — IMPS/NEFT/UPI/salary — is skipped.
+          if(bankStyle && !/^\d{10}$/.test(narStr.trim())){ skipped++; continue; }
+          creditRows.push({ref, amount:dp, received_date:date});
+        } else if(am!=null){
+          if(sheetIsCredit) creditRows.push({ref, amount:am, received_date:date});
+          else              debitRows.push({ref, vendor, amount:am, paid_date:date});
         }
       }
     });
@@ -585,7 +593,7 @@ async function importExcel(ev){
     const batch=async(table,rows)=>{ for(let i=0;i<rows.length;i+=400){ const {error}=await sb.from(table).upsert(rows.slice(i,i+400),{onConflict:'ref'}); if(error) throw error; } };
     if(debitRows.length) await batch('recon_debits',debitRows);
     if(creditRows.length) await batch('recon_credits',creditRows);
-    toast(`Imported ${debitRows.length} debit · ${creditRows.length} credit rows`);
+    toast(`Imported ${debitRows.length} debit · ${creditRows.length} credit`+(skipped?` · skipped ${skipped} non-MP rows`:''));
     loadAll();
   }catch(e){ toast('Import failed: '+(e.message||e),true); console.error(e); }
 }
