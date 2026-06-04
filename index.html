@@ -15,7 +15,7 @@
   const DEFAULT_DEDUCTION = 2295;   // flat amount MP State keeps per transaction
   const OVERDUE_DAYS      = 60;     // a pending refund older than this is flagged overdue
 </script>
-  
+
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -117,6 +117,24 @@
   .modal select,.modal input{width:100%;font-family:'IBM Plex Sans';font-size:14px;border:1px solid var(--line);border-radius:8px;padding:9px 10px;outline:none;background:#fff}
   .modal select:focus,.modal input:focus{border-color:var(--accent)}
   .modal-btns{display:flex;gap:8px;margin-top:18px;flex-wrap:wrap}
+
+  .card.c-bal .bar{background:#7c3aed}
+  .card.clickable{cursor:pointer;transition:transform .1s,border-color .1s}
+  .card.clickable:hover{border-color:var(--accent)} .card.clickable:active{transform:translateY(1px)}
+  .v.bal-pos{color:var(--ok)} .v.bal-neg{color:var(--check)}
+  .modal.wide{max-width:580px}
+  .modal-sub{font-size:11.5px;color:var(--muted);margin:-2px 0 10px}
+  .modal-list{max-height:55vh;overflow:auto;border:1px solid var(--line);border-radius:8px}
+  .modal-list table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .modal-list th{position:sticky;top:0;background:#f7f4ec;text-align:left;padding:7px 9px;font-size:10px;text-transform:uppercase;letter-spacing:.4px;color:var(--muted);border-bottom:1px solid var(--line);white-space:nowrap}
+  .modal-list td{padding:6px 9px;border-bottom:1px solid #f0ece3;white-space:nowrap}
+  .modal-list th.num,.modal-list td.num{text-align:right}
+  .modal-list tr.clickable{cursor:pointer} .modal-list tr.clickable:active{background:#f1ede3}
+  .modal-list .mt{padding:18px;text-align:center;color:var(--muted)}
+  .bal-row{display:flex;justify-content:space-between;font-size:13.5px;padding:5px 0}
+  .bal-row .lbl{color:var(--muted)}
+  .bal-row.tot{border-top:1px solid var(--line);margin-top:6px;padding-top:9px;font-weight:700;font-size:16px}
+  .tu-del{color:var(--check);cursor:pointer;font-weight:600}
 
   @media(max-width:640px){
     .wrap{padding:14px}
@@ -241,6 +259,33 @@
   </div>
 </div>
 
+<!-- entries list modal (OK / CHECK / PENDING / ORPHAN) -->
+<div class="modal-overlay" id="listOverlay" onclick="if(event.target===this)closeListModal()">
+  <div class="modal wide">
+    <div class="modal-h" id="listTitle"></div>
+    <div class="modal-sub" id="listSub">Tap a row to update its status.</div>
+    <div class="modal-list" id="listBody"></div>
+    <div class="modal-btns"><button class="btn btn-ghost" onclick="closeListModal()">close</button></div>
+  </div>
+</div>
+
+<!-- balance / top-up modal -->
+<div class="modal-overlay" id="balOverlay" onclick="if(event.target===this)closeBalModal()">
+  <div class="modal">
+    <div class="modal-h">Balance left</div>
+    <div id="balBreak"></div>
+    <label class="modal-l">Add money (top-up)</label>
+    <div style="display:flex;gap:8px">
+      <input id="tuAmt" type="number" step="0.01" placeholder="amount ₹" style="flex:1">
+      <button class="btn btn-pri" onclick="addTopup()">Add</button>
+    </div>
+    <input id="tuNote" placeholder="note (optional, e.g. tender EMD funding)" style="margin-top:8px">
+    <label class="modal-l">Top-ups added</label>
+    <div class="modal-list" id="tuList" style="max-height:30vh"></div>
+    <div class="modal-btns"><button class="btn btn-ghost" onclick="closeBalModal()">close</button></div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -248,7 +293,9 @@
 let sb = null;
 let DEBITS = [], CREDITS = [];
 let STATUS_OVERRIDES = {};            // ref -> {status, note}
+let TOPUPS = [];                      // [{id, amount, note, created_at}]
 const T_STATUS = 'recon_status';
+const T_TOPUP = 'recon_topups';
 let DEDUCTION = DEFAULT_DEDUCTION;
 let editingDebitId = null, editingCreditId = null;
 let stEditingRef = null;              // ref currently open in the status editor
@@ -286,15 +333,17 @@ function setConn(ok,txt){ const c=$('conn'); c.className='conn '+(ok?'ok':'bad')
 async function loadAll(){
   if(!sb) return;
   try{
-    const [d,c,s] = await Promise.all([
+    const [d,c,s,tu] = await Promise.all([
       sb.from('recon_debits').select('*').order('paid_date',{ascending:true}),
       sb.from('recon_credits').select('*').order('received_date',{ascending:true}),
-      sb.from(T_STATUS).select('*')
+      sb.from(T_STATUS).select('*'),
+      sb.from(T_TOPUP).select('*').order('created_at',{ascending:true})
     ]);
     if(d.error) throw d.error; if(c.error) throw c.error;
     DEBITS=d.data||[]; CREDITS=c.data||[];
     STATUS_OVERRIDES={};
     if(!s.error && s.data) s.data.forEach(r=>STATUS_OVERRIDES[r.ref]={status:r.status,note:r.note});
+    TOPUPS = (!tu.error && tu.data) ? tu.data : [];
     setConn(true,'connected · '+(DEBITS.length+CREDITS.length)+' rows');
     renderAll();
   }catch(e){ setConn(false,'error'); toast('Load failed: '+(e.message||e),true); console.error(e); }
@@ -370,13 +419,17 @@ function renderCards(rows){
     if(r.status==='PENDING'||r.status==='PENDING_OVERDUE') pendingExpected += (r.da-DEDUCTION);
   });
   const pendTotal=c.PENDING+c.PENDING_OVERDUE;
+  const topupSum=TOPUPS.reduce((a,t)=>a+(Number(t.amount)||0),0);
+  const balance = topupSum + refunded - paidOut;     // money added + refunds in − payments out
+  const balCls = balance<0 ? 'bal-neg' : 'bal-pos';
   $('cards').innerHTML=`
-    <div class="card c-ok"><div class="bar"></div><div class="k">OK</div><div class="v">${c.OK}</div></div>
-    <div class="card c-check"><div class="bar"></div><div class="k">Check</div><div class="v">${c.CHECK}</div></div>
-    <div class="card c-pend"><div class="bar"></div><div class="k">Pending${c.PENDING_OVERDUE?` · ${c.PENDING_OVERDUE} overdue`:''}</div><div class="v">${pendTotal}</div></div>
-    <div class="card c-orph"><div class="bar"></div><div class="k">Orphan</div><div class="v">${c.ORPHAN}</div></div>
+    <div class="card c-ok clickable" onclick="openListModal('OK')"><div class="bar"></div><div class="k">OK</div><div class="v">${c.OK}</div></div>
+    <div class="card c-check clickable" onclick="openListModal('CHECK')"><div class="bar"></div><div class="k">Check</div><div class="v">${c.CHECK}</div></div>
+    <div class="card c-pend clickable" onclick="openListModal('PENDING')"><div class="bar"></div><div class="k">Pending${c.PENDING_OVERDUE?` · ${c.PENDING_OVERDUE} overdue`:''}</div><div class="v">${pendTotal}</div></div>
+    <div class="card c-orph clickable" onclick="openListModal('ORPHAN')"><div class="bar"></div><div class="k">Orphan</div><div class="v">${c.ORPHAN}</div></div>
     <div class="card c-money"><div class="bar"></div><div class="k">Deducted ₹</div><div class="v small">${fmtMoney(deducted)}</div></div>
-    <div class="card c-ink"><div class="bar"></div><div class="k">Refund expected ₹</div><div class="v small">${fmtMoney(pendingExpected)}</div></div>`;
+    <div class="card c-ink"><div class="bar"></div><div class="k">Refund expected ₹</div><div class="v small">${fmtMoney(pendingExpected)}</div></div>
+    <div class="card c-bal clickable" onclick="openBalModal()"><div class="bar"></div><div class="k">Balance left ₹</div><div class="v small ${balCls}">${fmtMoney(balance)}</div></div>`;
 }
 
 function renderDebits(){
@@ -513,6 +566,75 @@ async function resetStatusToAuto(){
     toast('Reset to auto'); closeStatusEditor(); loadAll(); }
   catch(e){ toast('Reset failed: '+(e.message||e),true); }
 }
+
+/* ---------- entries list modal ---------- */
+const TILE_TITLE={OK:'OK — matched & correct',CHECK:'CHECK — wrong deduction',
+  PENDING:'PENDING — awaiting refund',ORPHAN:'ORPHAN — refund without payment'};
+function openListModal(kind){
+  const rows=computeRecon().filter(r=> kind==='PENDING' ? (r.status==='PENDING'||r.status==='PENDING_OVERDUE') : r.status===kind);
+  $('listTitle').textContent=(TILE_TITLE[kind]||kind)+'  ('+rows.length+')';
+  const body=$('listBody');
+  if(!rows.length){ body.innerHTML='<div class="mt">No entries here. 🎉</div>'; }
+  else{
+    let h='<table><thead><tr><th>Ref</th><th>Debit Dt</th><th class="num">Paid</th><th>Credit Dt</th><th class="num">Refund</th><th class="num">Deduct</th><th class="num">Days</th></tr></thead><tbody>';
+    rows.forEach(r=>{
+      const od = r.status==='PENDING_OVERDUE' ? ' style="color:var(--check)"' : '';
+      h+=`<tr class="clickable" onclick="closeListModal();openStatusEditor('${r.ref}')">
+        <td class="mono"${od}>${r.ref}</td>
+        <td class="mono">${r.debit?fmtDateISO(r.debit.paid_date):''}</td>
+        <td class="num">${fmtMoney(r.da)}</td>
+        <td class="mono">${r.credit?fmtDateISO(r.credit.received_date):''}</td>
+        <td class="num">${fmtMoney(r.ca)}</td>
+        <td class="num">${r.ded==null?'':fmtMoney(r.ded)}</td>
+        <td class="num">${r.days==null?'':r.days}</td></tr>`;
+    });
+    body.innerHTML=h+'</tbody></table>';
+  }
+  $('listOverlay').classList.add('show');
+}
+function closeListModal(){ $('listOverlay').classList.remove('show'); }
+
+/* ---------- balance / top-ups modal ---------- */
+function openBalModal(){
+  const rows=computeRecon();
+  let paidOut=0, refunded=0;
+  rows.forEach(r=>{ if(r.da!=null)paidOut+=r.da; if(r.ca!=null)refunded+=r.ca; });
+  const topupSum=TOPUPS.reduce((a,t)=>a+(Number(t.amount)||0),0);
+  const balance=topupSum+refunded-paidOut;
+  $('balBreak').innerHTML=`
+    <div class="bal-row"><span class="lbl">Money added (top-ups)</span><span class="mono">+ ${fmtMoney(topupSum)}</span></div>
+    <div class="bal-row"><span class="lbl">Refunds received</span><span class="mono">+ ${fmtMoney(refunded)}</span></div>
+    <div class="bal-row"><span class="lbl">Payments made</span><span class="mono">− ${fmtMoney(paidOut)}</span></div>
+    <div class="bal-row tot"><span>Balance left</span><span class="mono ${balance<0?'bal-neg':'bal-pos'}">${fmtMoney(balance)}</span></div>`;
+  renderTopups();
+  $('balOverlay').classList.add('show');
+}
+function renderTopups(){
+  const el=$('tuList');
+  if(!TOPUPS.length){ el.innerHTML='<div class="mt">No top-ups yet.</div>'; return; }
+  let h='<table><thead><tr><th>Date</th><th>Note</th><th class="num">Amount</th><th></th></tr></thead><tbody>';
+  TOPUPS.slice().reverse().forEach(t=>{
+    const dt=t.created_at?fmtDateISO(String(t.created_at).slice(0,10)):'';
+    h+=`<tr><td class="mono">${dt}</td><td>${t.note||''}</td><td class="num">${fmtMoney(t.amount)}</td>
+        <td><span class="tu-del" onclick="delTopup(${t.id})">del</span></td></tr>`;
+  });
+  el.innerHTML=h+'</tbody></table>';
+}
+async function addTopup(){
+  if(!sb) return toast('Not connected',true);
+  const amt=num($('tuAmt').value);
+  if(amt==null||amt===0) return toast('Enter an amount',true);
+  try{ const {error}=await sb.from(T_TOPUP).insert({amount:amt, note:$('tuNote').value.trim()||null}); if(error) throw error;
+    $('tuAmt').value=''; $('tuNote').value=''; toast('Top-up added'); await loadAll(); openBalModal(); }
+  catch(e){ toast('Failed: '+(e.message||e),true); }
+}
+async function delTopup(id){
+  if(!sb) return; if(!confirm('Delete this top-up?')) return;
+  try{ const {error}=await sb.from(T_TOPUP).delete().eq('id',id); if(error) throw error;
+    toast('Top-up deleted'); await loadAll(); openBalModal(); }
+  catch(e){ toast('Failed: '+(e.message||e),true); }
+}
+function closeBalModal(){ $('balOverlay').classList.remove('show'); }
 
 /* ---------- Excel import (handles bank-statement format AND clean export format) ---------- */
 function extractRef(v){
