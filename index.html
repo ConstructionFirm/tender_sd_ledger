@@ -14,6 +14,8 @@
   const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9seWxvcmFyYmFpenBvZ2Jiam1iIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM0ODEzMjIsImV4cCI6MjA4OTA1NzMyMn0.ESovUr-sRcrrFyLRY9g6dFeW-opcJUf0qyw_CbKBDVA";              // <-- paste your anon public key
   const DEFAULT_DEDUCTION = 2295;   // flat amount MP State keeps per transaction
   const OVERDUE_DAYS      = 60;     // a pending refund older than this is flagged overdue
+  const START_DATE        = "2026-05-20";  // Balance & funding tracked from here; earlier history excluded from Balance
+  const OPENING_FUNDING   = 180000;        // cash you had funded into the account as of START_DATE
 </script>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -408,6 +410,26 @@ function renderRecon(){
   renderCards(rows);
 }
 
+/* ---------- balance & funding (scoped to START_DATE) ---------- */
+function minFundingNeeded(startISO){
+  // deepest the tender pool dipped, using only payments(out) and refunds(in) on/after startISO
+  const ev=[];
+  DEBITS.forEach(d=>{ if(d.paid_date && d.paid_date>=startISO) ev.push([d.paid_date,0,-(+d.amount||0)]); });
+  CREDITS.forEach(c=>{ if(c.received_date && c.received_date>=startISO) ev.push([c.received_date,1,(+c.amount||0)]); });
+  ev.sort((a,b)=> a[0]<b[0]?-1 : a[0]>b[0]?1 : a[1]-b[1]);  // same day: payments first (conservative)
+  let run=0, low=0;
+  ev.forEach(e=>{ run+=e[2]; if(run<low) low=run; });
+  return -low;
+}
+function computeBalance(){
+  const s=START_DATE;
+  const paidAfter = DEBITS.filter(d=>d.paid_date && d.paid_date>=s).reduce((a,d)=>a+(+d.amount||0),0);
+  const refAfter  = CREDITS.filter(c=>c.received_date && c.received_date>=s).reduce((a,c)=>a+(+c.amount||0),0);
+  const topupAfter= TOPUPS.filter(t=>t.created_at && String(t.created_at).slice(0,10)>=s).reduce((a,t)=>a+(+t.amount||0),0);
+  const balance = OPENING_FUNDING + topupAfter + refAfter - paidAfter;
+  return {paidAfter, refAfter, topupAfter, balance, minNeed:minFundingNeeded(s)};
+}
+
 function renderCards(rows){
   const c={OK:0,CHECK:0,PENDING:0,PENDING_OVERDUE:0,ORPHAN:0};
   let paidOut=0, refunded=0, deducted=0, pendingExpected=0;
@@ -419,8 +441,7 @@ function renderCards(rows){
     if(r.status==='PENDING'||r.status==='PENDING_OVERDUE') pendingExpected += (r.da-DEDUCTION);
   });
   const pendTotal=c.PENDING+c.PENDING_OVERDUE;
-  const topupSum=TOPUPS.reduce((a,t)=>a+(Number(t.amount)||0),0);
-  const balance = topupSum + refunded - paidOut;     // money added + refunds in − payments out
+  const balance = computeBalance().balance;     // scoped to START_DATE + opening funding
   const balCls = balance<0 ? 'bal-neg' : 'bal-pos';
   $('cards').innerHTML=`
     <div class="card c-ok clickable" onclick="openListModal('OK')"><div class="bar"></div><div class="k">OK</div><div class="v">${c.OK}</div></div>
@@ -596,16 +617,16 @@ function closeListModal(){ $('listOverlay').classList.remove('show'); }
 
 /* ---------- balance / top-ups modal ---------- */
 function openBalModal(){
-  const rows=computeRecon();
-  let paidOut=0, refunded=0;
-  rows.forEach(r=>{ if(r.da!=null)paidOut+=r.da; if(r.ca!=null)refunded+=r.ca; });
-  const topupSum=TOPUPS.reduce((a,t)=>a+(Number(t.amount)||0),0);
-  const balance=topupSum+refunded-paidOut;
+  const b=computeBalance();
+  const sd=fmtDateISO(START_DATE);
   $('balBreak').innerHTML=`
-    <div class="bal-row"><span class="lbl">Money added (top-ups)</span><span class="mono">+ ${fmtMoney(topupSum)}</span></div>
-    <div class="bal-row"><span class="lbl">Refunds received</span><span class="mono">+ ${fmtMoney(refunded)}</span></div>
-    <div class="bal-row"><span class="lbl">Payments made</span><span class="mono">− ${fmtMoney(paidOut)}</span></div>
-    <div class="bal-row tot"><span>Balance left</span><span class="mono ${balance<0?'bal-neg':'bal-pos'}">${fmtMoney(balance)}</span></div>`;
+    <div class="modal-sub">Tracking from ${sd} · earlier history excluded</div>
+    <div class="bal-row"><span class="lbl">Opening funding (as of ${sd})</span><span class="mono">+ ${fmtMoney(OPENING_FUNDING)}</span></div>
+    <div class="bal-row"><span class="lbl">Top-ups added since</span><span class="mono">+ ${fmtMoney(b.topupAfter)}</span></div>
+    <div class="bal-row"><span class="lbl">Refunds received since</span><span class="mono">+ ${fmtMoney(b.refAfter)}</span></div>
+    <div class="bal-row"><span class="lbl">Payments made since</span><span class="mono">− ${fmtMoney(b.paidAfter)}</span></div>
+    <div class="bal-row tot"><span>Balance left</span><span class="mono ${b.balance<0?'bal-neg':'bal-pos'}">${fmtMoney(b.balance)}</span></div>
+    <div class="bal-row" style="margin-top:8px"><span class="lbl">Minimum funding needed (since ${sd})</span><span class="mono">${fmtMoney(b.minNeed)}</span></div>`;
   renderTopups();
   $('balOverlay').classList.add('show');
 }
