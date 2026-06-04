@@ -428,7 +428,7 @@ function renderCards(rows){
     <div class="card c-pend clickable" onclick="openListModal('PENDING')"><div class="bar"></div><div class="k">Pending${c.PENDING_OVERDUE?` · ${c.PENDING_OVERDUE} overdue`:''}</div><div class="v">${pendTotal}</div></div>
     <div class="card c-orph clickable" onclick="openListModal('ORPHAN')"><div class="bar"></div><div class="k">Orphan</div><div class="v">${c.ORPHAN}</div></div>
     <div class="card c-money"><div class="bar"></div><div class="k">Deducted ₹2295</div><div class="v small">${fmtMoney(deducted)}</div></div>
-    <div class="card c-ink"><div class="bar"></div><div class="k">Refund expected ₹</div><div class="v small">${fmtMoney(pendingExpected)}</div></div>
+    <div class="card c-ink"><div class="bar"></div><div class="k">Refund Pending ₹</div><div class="v small">${fmtMoney(pendingExpected)}</div></div>
     <div class="card c-bal clickable" onclick="openBalModal()"><div class="bar"></div><div class="k">Balance left ₹</div><div class="v small ${balCls}">${fmtMoney(balance)}</div></div>`;
 }
 
